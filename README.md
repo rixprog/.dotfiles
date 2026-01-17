@@ -83,7 +83,7 @@ This setup uses the **bare Git repository** method (no symlinks, no clutter).
 ### 1️⃣ Clone the repository
 
 ```bash
-git clone --bare git@github.com:YOUR_USERNAME/dotfiles.git ~/.dotfiles
+git clone --bare git@github.com:rixprog/dotfiles.git ~/.dotfiles
 ```
 
 ### 2️⃣ Setup alias
