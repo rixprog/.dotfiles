@@ -1,0 +1,7 @@
+[user]
+	name = rixprog
+	email = riswanmuhammed390@gmail.com
+[credential]
+	helper = store
+[core]
+	excludesfile = /home/rix/.gitignore_global
