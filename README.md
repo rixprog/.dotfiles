@@ -1,4 +1,4 @@
-# 🏠 Dotfiles – Hyprland (Fedora)
+# Dotfiles – Hyprland (Fedora)
 
 My personal Linux configuration files for a minimal, fast, and developer-friendly workstation.
 
@@ -9,6 +9,16 @@ My personal Linux configuration files for a minimal, fast, and developer-friendl
 - **Editor:** Neovim
 - **Bar:** Waybar
 - **Launcher:** Rofi
+
+> **Credit:** This configuration is based on [ML4W's dotfiles](https://github.com/mylinuxforwork/dotfiles) with personal modifications and adaptations for my workflow.
+
+---
+
+## 📸 Overview
+
+![Desktop Overview](.wm_screenshots/desktop.jpg)
+![Tiling](.wm_screenshots/tiling.jpg)
+![Rofi](.wm_screenshots/rofi.jpg)
 
 ---
 
@@ -40,6 +50,7 @@ My personal Linux configuration files for a minimal, fast, and developer-friendl
 .zshrc
 .gitconfig
 .Xresources
+.wm_screenshots/
 ```
 
 ---
@@ -103,3 +114,13 @@ dot config --local status.showUntrackedFiles no
 ```
 
 ✅ **Done.**
+
+---
+
+## 🙏 Acknowledgments
+
+- [ML4W (MyLinuxForWork)](https://github.com/mylinuxforwork/dotfiles) – Original dotfiles inspiration and base configuration
+- The Hyprland community
+- All the amazing open-source projects that make this setup possible
+
+
