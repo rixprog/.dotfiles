@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# WhatsApp Web as an always-ready sidepad: Brave --app window, pinned and parked
+# off the left screen edge via the ML4W sidepad script, slid in/out with a keybind.
+# Independent of the Firefox sidepad (different window class).
+#
+#   whatsapp-web --start    wait for network, launch hidden (used at login)
+#   whatsapp-web            toggle (launches it first if it isn't running)
+
+URL="https://web.whatsapp.com"
+PROFILE="$HOME/.local/share/whatsapp-web"
+CLASS="brave-web.whatsapp.com__-Default"
+SIDEPAD="$HOME/.config/sidepad/sidepad"
+PAD_OPTS=(--class "$CLASS" --width 900 --hidden-gap 0)
+
+client() {
+    hyprctl clients -j | jq -c --arg c "$CLASS" 'first(.[] | select(.class == $c)) // empty'
+}
+
+launch() {
+    # Already starting (e.g. keybind pressed during login autostart): just wait for the window.
+    if ! pgrep -f -- "--user-data-dir=$PROFILE" >/dev/null; then
+        setsid brave-browser --user-data-dir="$PROFILE" --no-first-run --no-default-browser-check \
+            --app="$URL" >/dev/null 2>&1 < /dev/null &
+    fi
+    for _ in $(seq 1 40); do
+        [ -n "$(client)" ] && return 0
+        sleep 0.25
+    done
+    return 1
+}
+
+# Sidepad needs a floating, pinned window on a regular workspace.
+adopt() {
+    local info addr
+    info=$(client)
+    addr=$(jq -r .address <<<"$info")
+    if [[ $(jq -r .workspace.name <<<"$info") == special:* ]]; then
+        hyprctl dispatch movetoworkspacesilent "$(hyprctl activeworkspace -j | jq -r .id),address:$addr" >/dev/null
+    fi
+    [ "$(jq -r .floating <<<"$info")" = true ] || hyprctl dispatch setfloating "address:$addr" >/dev/null
+    [ "$(jq -r .pinned <<<"$info")" = true ] || hyprctl dispatch pin "address:$addr" >/dev/null
+}
+
+hide() {
+    "$SIDEPAD" "${PAD_OPTS[@]}" --hide >/dev/null
+    # Don't leave keyboard focus on the off-screen window.
+    if [ "$(hyprctl activewindow -j | jq -r .class)" = "$CLASS" ]; then
+        hyprctl dispatch focuscurrentorlast >/dev/null
+    fi
+}
+
+show() {
+    "$SIDEPAD" "${PAD_OPTS[@]}" >/dev/null
+    hyprctl dispatch focuswindow "address:$(client | jq -r .address)" >/dev/null
+}
+
+if [ "$1" = "--start" ]; then
+    nm-online -q -t 300
+    if [ -z "$(client)" ]; then
+        launch || exit 1
+        adopt
+        hide
+    fi
+    exit 0
+fi
+
+if [ -z "$(client)" ]; then
+    launch || exit 1
+    adopt
+    hide
+    show
+    exit 0
+fi
+
+adopt
+if (( $(client | jq -r '.at[0]') < 0 )); then
+    show
+else
+    hide
+fi

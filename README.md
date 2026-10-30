@@ -38,7 +38,7 @@ My personal Linux configuration files for a minimal, fast, and developer-friendl
 
 ```
 .config/
-  hypr/
+  hypr/        -> symlinks into .mydotfiles/ (ML4W layout)
   waybar/
   kitty/
   nvim/
@@ -46,12 +46,22 @@ My personal Linux configuration files for a minimal, fast, and developer-friendl
   swaync/
   fastfetch/
   ohmyposh/
+  pipewire/    "Both Earbuds" sink (plays to every Bluetooth headset at once)
+.mydotfiles/com.ml4w.dotfiles.stable/
+  .config/...  the real files the symlinks above point to
+  .bashrc  .zshrc  .Xresources
+.local/bin/
+  music-popup  Spotify popup: controls, seek, repeat, synced lyrics + English translation
+  whatsapp-web WhatsApp Web sidepad
 .bashrc
 .zshrc
 .gitconfig
 .Xresources
 .wm_screenshots/
 ```
+
+**Music popup:** `Super + Shift + P` (bound in `.config/hypr/conf/custom.conf`).
+Needs `gtk4-layer-shell`, `playerctl` and `python3-gobject`.
 
 ---
 

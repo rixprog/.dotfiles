@@ -1,0 +1,722 @@
+#!/usr/bin/python3
+# Now-playing popup for Hyprland: album art, prev / play-pause / next, a repeat
+# button, a seek slider, and synced lyrics from lrclib.net with an
+# optional English translation (Google Translate). Floats over the top-right
+# corner as a layer-shell surface. Run it again (keybind) or press Esc to close.
+#
+# Keys while the mouse is over it: Space play/pause, Left/Right seek 5s,
+# N next, P previous, R repeat, L lyrics, T translation, Esc close.
+# Clicking a lyric line jumps to it.
+#
+# Uses the system python (the PATH one lacks the GTK bindings).
+
+import os
+import sys
+
+# gtk4-layer-shell has to be loaded before libwayland-client, so re-exec preloaded.
+LAYER_SHELL_LIB = "/usr/lib64/libgtk4-layer-shell.so.0"
+if LAYER_SHELL_LIB not in os.environ.get("LD_PRELOAD", ""):
+    os.environ["LD_PRELOAD"] = ":".join(filter(None, [LAYER_SHELL_LIB, os.environ.get("LD_PRELOAD")]))
+    os.execv(sys.executable, [sys.executable, *sys.argv])
+
+import bisect
+import json
+import re
+import time
+from urllib.parse import urlencode
+
+import gi
+
+for ns, ver in (("Gtk", "4.0"), ("Gdk", "4.0"), ("Gtk4LayerShell", "1.0"), ("Playerctl", "2.0"), ("Soup", "3.0"), ("Pango", "1.0")):
+    gi.require_version(ns, ver)
+from gi.repository import Gdk, Gio, GLib, Gtk, Pango, Playerctl, Soup
+from gi.repository import Gtk4LayerShell as LayerShell
+
+APP_ID = "local.rix.MusicPopup"
+PREFERRED_PLAYER = "spotify"
+LRCLIB = "https://lrclib.net/api"
+TRANSLATE = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t"
+LYRICS_FLAG = os.path.join(GLib.get_user_state_dir(), "music-popup-lyrics")  # exists = lyrics panel open
+TRANSLATE_FLAG = os.path.join(GLib.get_user_state_dir(), "music-popup-translate")  # exists = translation on
+ART_SIZE = 72
+
+# Colors come from the Matugen palette in ~/.config/gtk-4.0/colors.css, so the
+# popup follows the wallpaper theme like the rest of the desktop.
+CSS = """
+window.music-popup { background: transparent; }
+.card {
+    background-color: alpha(@window_bg_color, 0.96);
+    color: @window_fg_color;
+    border-radius: 18px;
+    border: 1px solid alpha(@accent_color, 0.30);
+    padding: 16px;
+}
+.art { border-radius: 12px; background-color: alpha(@window_fg_color, 0.08); }
+.title { font-weight: 700; font-size: 1.1em; }
+.subtitle { opacity: 0.7; font-size: 0.9em; }
+.time { font-size: 0.8em; opacity: 0.6; font-feature-settings: "tnum"; }
+scale { padding: 6px 0; }
+scale trough { min-height: 4px; border-radius: 4px; background-color: alpha(@window_fg_color, 0.15); }
+scale highlight { min-height: 4px; border-radius: 4px; background-color: @accent_color; }
+scale slider {
+    min-width: 12px; min-height: 12px; margin: -5px;
+    border-radius: 50%; border: none; box-shadow: none;
+    background-color: @accent_color;
+}
+.controls button {
+    background: none; border: none; box-shadow: none;
+    min-width: 34px; min-height: 34px; padding: 0; border-radius: 50%;
+    color: @window_fg_color;
+}
+.controls button:hover { background-color: alpha(@window_fg_color, 0.10); }
+.controls button:checked, .controls button.on { color: @accent_color; background-color: alpha(@accent_color, 0.15); }
+.controls button.text { font-weight: 700; font-size: 0.8em; }
+.controls button.play { min-width: 46px; min-height: 46px; background-color: @accent_color; color: @accent_fg_color; }
+.controls button.play:hover { background-color: shade(@accent_color, 1.1); }
+.lyrics { margin-top: 12px; }
+.lyric { opacity: 0.45; padding: 3px 6px; border-radius: 8px; transition: opacity 200ms; }
+.lyric:hover { opacity: 0.8; background-color: alpha(@window_fg_color, 0.06); }
+.lyric.current { opacity: 1; font-weight: 700; color: @accent_color; }
+.lyric.plain { opacity: 0.85; }
+.lyric.plain:hover { background: none; }
+.translation { font-size: 0.85em; font-weight: 400; font-style: italic; opacity: 0.8; }
+.dim { opacity: 0.55; }
+"""
+
+LRC_TAG = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]")
+
+
+def fmt(seconds):
+    seconds = max(0, int(seconds))
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def parse_lrc(text):
+    """'[01:02.30]words' lines -> sorted [(seconds, words)]; a line may carry several stamps."""
+    lines = []
+    for raw in text.splitlines():
+        stamps = LRC_TAG.findall(raw)
+        words = LRC_TAG.sub("", raw).strip()
+        for minutes, seconds in stamps:
+            lines.append((int(minutes) * 60 + float(seconds), words))
+    return sorted(lines, key=lambda line: line[0])
+
+
+def best_match(results, duration):
+    """Pick the closest-length search hit, preferring ones with synced lyrics."""
+    if not isinstance(results, list):
+        return None
+    close = [r for r in results if abs((r.get("duration") or 0) - duration) <= 3] or results
+    return next((r for r in close if r.get("syncedLyrics")), None) or next(
+        (r for r in close if r.get("plainLyrics") or r.get("instrumental")), None)
+
+
+class MusicPopup(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID)
+        self.win = None
+        self.player = None
+        self.track_id = None
+        self.title = self.artist = self.album = ""
+        self.length = 0.0
+        self.art_url = None
+        self.seek_hold_until = 0.0
+        self.seek_target = 0.0
+        self.pending_seek = 0
+        self.lyrics_for = None
+        self.lyric_times = []
+        self.lyric_rows = []       # one vertical box per line: [lyric label, translation label]
+        self.lyric_lines = []      # the text of each row, for translating
+        self.translations = {}     # track id -> English line per row
+        self.current_line = -1
+        self.recentre = False
+        self.scroll_target = 0.0
+        self.scroll_anim = 0
+        self.http = Soup.Session(user_agent="music-popup/1.0 (personal Hyprland widget)", timeout=10)
+
+    # --- window -------------------------------------------------------------
+
+    def do_activate(self):
+        if self.win:  # second press of the shortcut closes it
+            self.win.close()
+            return
+        self.build()
+        self.lyrics_btn.set_active(os.path.exists(LYRICS_FLAG))
+        self.translate_btn.set_active(os.path.exists(TRANSLATE_FLAG))
+        self.manager = Playerctl.PlayerManager()
+        self.manager.connect("name-appeared", lambda _m, name: self.attach(name))
+        self.manager.connect("player-vanished", self.on_player_vanished)
+        for name in self.manager.props.player_names:
+            self.attach(name)
+        if not self.player:
+            self.show_idle()
+        GLib.timeout_add(200, self.tick)
+        self.win.present()
+
+    def build(self):
+        provider = Gtk.CssProvider()
+        provider.load_from_string(CSS)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        win = self.win = Gtk.Window(application=self, title="Music")
+        win.add_css_class("music-popup")
+        LayerShell.init_for_window(win)
+        LayerShell.set_namespace(win, "music-popup")
+        LayerShell.set_layer(win, LayerShell.Layer.OVERLAY)
+        for edge, margin in ((LayerShell.Edge.TOP, 10), (LayerShell.Edge.RIGHT, 10)):
+            LayerShell.set_anchor(win, edge, True)
+            LayerShell.set_margin(win, edge, margin)
+        win.connect("close-request", self.on_close)
+
+        # Only accept the keyboard while the mouse is over the popup. A layer that
+        # keeps keyboard interactivity holds on to focus, so clicking a normal
+        # window afterwards wouldn't get it back.
+        LayerShell.set_keyboard_mode(win, LayerShell.KeyboardMode.NONE)
+        hover = Gtk.EventControllerMotion()
+        hover.connect("enter", lambda *_a: LayerShell.set_keyboard_mode(win, LayerShell.KeyboardMode.ON_DEMAND))
+        hover.connect("leave", lambda *_a: LayerShell.set_keyboard_mode(win, LayerShell.KeyboardMode.NONE))
+        win.add_controller(hover)
+
+        keys = Gtk.EventControllerKey()
+        keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        keys.connect("key-pressed", self.on_key)
+        win.add_controller(keys)
+
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        card.add_css_class("card")
+        card.set_size_request(360, -1)
+        win.set_child(card)
+
+        # Art + track info
+        header = Gtk.Box(spacing=14)
+        art_frame = Gtk.Box()
+        art_frame.add_css_class("art")
+        art_frame.set_overflow(Gtk.Overflow.HIDDEN)
+        art_frame.set_size_request(ART_SIZE, ART_SIZE)
+        art_frame.set_valign(Gtk.Align.CENTER)
+        self.art = Gtk.Image(hexpand=True, halign=Gtk.Align.CENTER)
+        art_frame.set_hexpand(False)
+        art_frame.append(self.art)
+        header.append(art_frame)
+
+        info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, valign=Gtk.Align.CENTER, hexpand=True)
+        self.title_label = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END, max_width_chars=24)
+        self.title_label.add_css_class("title")
+        self.artist_label = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END, max_width_chars=28)
+        self.artist_label.add_css_class("subtitle")
+        self.album_label = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END, max_width_chars=28)
+        self.album_label.add_css_class("subtitle")
+        for label in (self.title_label, self.artist_label, self.album_label):
+            info.append(label)
+        header.append(info)
+        card.append(header)
+
+        # Seek slider
+        self.scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 1, 1)
+        self.scale.set_draw_value(False)
+        self.scale.set_focusable(False)
+        self.scale.connect("change-value", self.on_scrub)
+        card.append(self.scale)
+
+        times = Gtk.Box()
+        self.pos_label = Gtk.Label(label="0:00", xalign=0, hexpand=True)
+        self.len_label = Gtk.Label(label="0:00", xalign=1)
+        for label in (self.pos_label, self.len_label):
+            label.add_css_class("time")
+            times.append(label)
+        card.append(times)
+
+        # Transport controls
+        controls = Gtk.CenterBox()
+        controls.add_css_class("controls")
+        middle = Gtk.Box(spacing=12)
+        self.prev_btn = self.icon_button("media-skip-backward-symbolic", "Previous (P)", lambda: self.call("previous"))
+        self.play_btn = self.icon_button("media-playback-start-symbolic", "Play / pause (Space)", lambda: self.call("play_pause"))
+        self.play_btn.add_css_class("play")
+        self.next_btn = self.icon_button("media-skip-forward-symbolic", "Next (N)", lambda: self.call("next"))
+        for button in (self.prev_btn, self.play_btn, self.next_btn):
+            button.set_valign(Gtk.Align.CENTER)
+            middle.append(button)
+        controls.set_center_widget(middle)
+
+        self.repeat_btn = self.icon_button("media-playlist-repeat-symbolic", "Repeat (R)", self.toggle_loop)
+        self.repeat_btn.set_valign(Gtk.Align.CENTER)
+        controls.set_start_widget(self.repeat_btn)
+
+        end = Gtk.Box(spacing=2, valign=Gtk.Align.CENTER)
+        self.translate_btn = Gtk.ToggleButton(label="EN", tooltip_text="English translation (T)",
+                                              focusable=False, visible=False)
+        self.translate_btn.add_css_class("text")
+        self.translate_btn.connect("toggled", self.on_translate_toggled)
+        self.lyrics_btn = Gtk.ToggleButton(icon_name="format-justify-center-symbolic",
+                                           tooltip_text="Lyrics (L)", focusable=False)
+        self.lyrics_btn.connect("toggled", self.on_lyrics_toggled)
+        end.append(self.translate_btn)
+        end.append(self.lyrics_btn)
+        controls.set_end_widget(end)
+        card.append(controls)
+
+        # Lyrics panel
+        self.lyrics_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.lyrics_scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, min_content_height=280)
+        self.lyrics_scroll.set_child(self.lyrics_box)
+        self.lyrics_scroll.add_css_class("lyrics")
+        self.revealer = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.SLIDE_DOWN, transition_duration=180)
+        self.revealer.set_child(self.lyrics_scroll)
+        self.revealer.connect("notify::child-revealed", self.on_lyrics_revealed)
+        card.append(self.revealer)
+
+    def icon_button(self, icon, tooltip, action):
+        button = Gtk.Button(icon_name=icon, tooltip_text=tooltip, focusable=False)
+        button.connect("clicked", lambda _b: action())
+        return button
+
+    def on_close(self, _win):
+        self.win = None
+        return False
+
+    def on_key(self, _ctrl, keyval, _code, _state):
+        action = {
+            "Escape": self.win.close,
+            "space": lambda: self.call("play_pause"),
+            "Left": lambda: self.nudge(-5),
+            "Right": lambda: self.nudge(5),
+            "n": lambda: self.call("next"),
+            "p": lambda: self.call("previous"),
+            "r": self.toggle_loop,
+            "l": lambda: self.lyrics_btn.set_active(not self.lyrics_btn.get_active()),
+            "t": lambda: self.translate_btn.get_visible() and self.translate_btn.set_active(
+                not self.translate_btn.get_active()),
+        }.get(Gdk.keyval_name(keyval))
+        if action:
+            action()
+        return action is not None
+
+    # --- player -------------------------------------------------------------
+
+    def attach(self, name):
+        current = self.player.props.player_name if self.player else None
+        if current == PREFERRED_PLAYER or (current and name.name != PREFERRED_PLAYER):
+            return
+        player = Playerctl.Player.new_from_name(name)
+        self.manager.manage_player(player)
+        player.connect("metadata", lambda p, _m: p is self.player and self.refresh_track())
+        player.connect("playback-status", lambda p, _s: p is self.player and self.refresh_status())
+        player.connect("loop-status", lambda p, status: p is self.player and self.show_loop(status))
+        self.player = player
+        self.refresh_track()
+        self.refresh_status()
+        self.show_loop(self.loop_property())
+
+    def on_player_vanished(self, _manager, player):
+        if player is not self.player:
+            return
+        self.player = None
+        for name in self.manager.props.player_names:
+            self.attach(name)
+        if not self.player:
+            self.show_idle()
+
+    def call(self, method):
+        if self.player:
+            try:
+                getattr(self.player, method)()
+            except GLib.Error:
+                pass
+
+    def show_idle(self):
+        self.track_id = None
+        self.length = 0.0
+        self.title_label.set_text("Nothing playing")
+        self.artist_label.set_text("Open Spotify with Super + P")
+        self.album_label.set_text("")
+        self.set_placeholder_art()
+        self.scale.set_range(0, 1)
+        self.scale.set_value(0)
+        self.pos_label.set_text("0:00")
+        self.len_label.set_text("0:00")
+        for widget in self.player_widgets():
+            widget.set_sensitive(False)
+        self.show_loop("None")
+        self.set_lyrics_message("Nothing playing")
+        self.lyrics_for = None
+
+    def refresh_track(self):
+        metadata = self.player.props.metadata
+        meta = metadata.unpack() if metadata else {}
+        artists = meta.get("xesam:artist") or []
+        if isinstance(artists, str):
+            artists = [artists]
+        self.title = meta.get("xesam:title") or "Unknown title"
+        self.artist = artists[0] if artists else ""
+        self.album = meta.get("xesam:album") or ""
+        self.length = (meta.get("mpris:length") or 0) / 1e6
+        self.track_id = meta.get("mpris:trackid") or f"{self.title}|{self.artist}"
+
+        self.title_label.set_text(self.title)
+        self.title_label.set_tooltip_text(self.title)
+        self.artist_label.set_text(", ".join(artists))
+        self.album_label.set_text(self.album)
+        self.scale.set_range(0, max(self.length, 1))
+        self.len_label.set_text(fmt(self.length))
+        for widget in self.player_widgets():
+            widget.set_sensitive(True)
+
+        art_url = meta.get("mpris:artUrl")
+        if art_url != self.art_url:
+            self.art_url = art_url
+            self.set_placeholder_art()
+            if art_url:
+                self.load_art(art_url)
+
+        if self.track_id.startswith("/com/spotify/ad/"):
+            self.lyrics_for = self.track_id
+            self.set_lyrics_message("Ad playing — lyrics are back after it")
+        elif self.revealer.get_reveal_child() and self.lyrics_for != self.track_id:
+            self.load_lyrics()
+
+    def player_widgets(self):
+        return (self.prev_btn, self.play_btn, self.next_btn, self.scale, self.repeat_btn)
+
+    def refresh_status(self):
+        playing = self.player.props.playback_status == Playerctl.PlaybackStatus.PLAYING
+        self.play_btn.set_icon_name("media-playback-pause-symbolic" if playing else "media-playback-start-symbolic")
+
+    def loop_property(self, value=None):
+        """Read LoopStatus ("None" / "Track" / "Playlist") straight from the player, or set it.
+
+        Goes over D-Bus directly: playerctl's cached value goes stale with Spotify,
+        and its setter silently did nothing in testing.
+        """
+        bus_name = f"org.mpris.MediaPlayer2.{self.player.props.player_instance}"
+        iface = "org.mpris.MediaPlayer2.Player"
+        if value is None:
+            args, method = GLib.Variant("(ss)", (iface, "LoopStatus")), "Get"
+        else:
+            args, method = GLib.Variant("(ssv)", (iface, "LoopStatus", GLib.Variant("s", value))), "Set"
+        try:
+            reply = Gio.bus_get_sync(Gio.BusType.SESSION).call_sync(
+                bus_name, "/org/mpris/MediaPlayer2", "org.freedesktop.DBus.Properties", method,
+                args, None, Gio.DBusCallFlags.NONE, 1000)
+        except GLib.Error:
+            return None
+        return reply.unpack()[0] if value is None else value
+
+    def toggle_loop(self):
+        """Repeat on (the whole album / playlist), or off if any repeat is on."""
+        if not self.player or not self.track_id:
+            return
+        wanted = "Playlist" if self.loop_property() == "None" else "None"
+        self.loop_property(wanted)
+
+        def check():
+            # Spotify ignores repeat during Autoplay and ads; show what it really did.
+            actual = self.loop_property()
+            if not self.win:
+                return False
+            self.show_loop(actual)
+            if actual != wanted:
+                self.flash("Spotify won't repeat here (Autoplay or ad)")
+            return False
+
+        GLib.timeout_add(500, check)
+
+    def show_loop(self, status):
+        if isinstance(status, Playerctl.LoopStatus):
+            status = {Playerctl.LoopStatus.TRACK: "Track", Playerctl.LoopStatus.PLAYLIST: "Playlist"}.get(status, "None")
+        if status in ("Playlist", "Track"):  # Track = repeat-one set from Spotify itself
+            self.repeat_btn.add_css_class("on")
+        else:
+            self.repeat_btn.remove_css_class("on")
+
+    def flash(self, text):
+        """Show a note in place of the album name for a few seconds."""
+        self.album_label.set_text(text)
+        GLib.timeout_add(3000, lambda: self.win and self.album_label.set_text(self.album) and False)
+
+    def tick(self):
+        if not self.win:
+            return False
+        if self.player and self.track_id:
+            try:
+                position = self.player.get_position() / 1e6
+            except GLib.Error:
+                position = 0.0
+            if time.monotonic() >= self.seek_hold_until:
+                self.scale.set_value(position)
+                self.pos_label.set_text(fmt(position))
+            self.follow_lyrics(position)
+        return True
+
+    # --- seeking ------------------------------------------------------------
+
+    def on_scrub(self, _scale, _scroll, value):
+        # Fires continuously while dragging; only send the last value every 150ms.
+        self.seek_target = min(max(value, 0), self.length)
+        self.pos_label.set_text(fmt(self.seek_target))
+        self.seek_hold_until = time.monotonic() + 1.0
+        if not self.pending_seek:
+            self.pending_seek = GLib.timeout_add(150, self.flush_seek)
+        return False
+
+    def flush_seek(self):
+        self.pending_seek = 0
+        self.seek_to(self.seek_target)
+        return False
+
+    def nudge(self, delta):
+        if self.player and self.track_id:
+            try:
+                self.seek_to(self.player.get_position() / 1e6 + delta)
+            except GLib.Error:
+                pass
+
+    def seek_to(self, seconds):
+        if not self.player:
+            return
+        seconds = min(max(seconds, 0), max(self.length - 1, 0))
+        try:
+            self.player.set_position(int(seconds * 1e6))
+        except GLib.Error:
+            return
+        self.scale.set_value(seconds)
+        self.pos_label.set_text(fmt(seconds))
+        self.seek_hold_until = time.monotonic() + 0.6
+
+    # --- network ------------------------------------------------------------
+
+    def fetch(self, request, callback):
+        """Send request (a URL to GET, or a Soup.Message) and hand (status, bytes) to callback, (0, None) on failure."""
+        message = Soup.Message.new("GET", request) if isinstance(request, str) else request
+
+        def done(session, result):
+            try:
+                body = session.send_and_read_finish(result)
+                callback(int(message.get_status()), body)
+            except GLib.Error:
+                callback(0, None)
+
+        self.http.send_and_read_async(message, GLib.PRIORITY_DEFAULT, None, done)
+
+    def fetch_json(self, request, callback):
+        def done(status, body):
+            try:
+                callback(json.loads(body.get_data()) if status == 200 else None)
+            except ValueError:
+                callback(None)
+
+        self.fetch(request, done)
+
+    def set_placeholder_art(self):
+        self.art.set_pixel_size(32)
+        self.art.set_from_icon_name("audio-x-generic-symbolic")
+
+    def load_art(self, url):
+        def done(status, body):
+            if url != self.art_url or not self.win or status != 200:
+                return
+            try:
+                texture = Gdk.Texture.new_from_bytes(body)
+            except GLib.Error:
+                return
+            self.art.set_pixel_size(ART_SIZE)
+            self.art.set_from_paintable(texture)
+
+        self.fetch(url, done)
+
+    # --- lyrics -------------------------------------------------------------
+
+    def on_lyrics_toggled(self, button):
+        show = button.get_active()
+        self.revealer.set_reveal_child(show)
+        try:
+            if show:
+                open(LYRICS_FLAG, "w").close()
+            elif os.path.exists(LYRICS_FLAG):
+                os.remove(LYRICS_FLAG)
+        except OSError:
+            pass
+        if show and self.player and self.track_id and self.lyrics_for != self.track_id:
+            self.load_lyrics()
+        self.recentre = True
+        self.update_translate_button()
+
+    def on_lyrics_revealed(self, revealer, _pspec):
+        # GTK windows grow on their own but never shrink back; once the panel
+        # has slid shut, drop the remembered size so the popup fits again.
+        if not revealer.get_child_revealed() and self.win:
+            self.win.set_default_size(1, 1)
+
+    def load_lyrics(self):
+        track = self.lyrics_for = self.track_id
+        self.set_lyrics_message("Looking for lyrics…")
+        exact = urlencode({"track_name": self.title, "artist_name": self.artist,
+                           "album_name": self.album, "duration": round(self.length)})
+        loose = urlencode({"track_name": self.title, "artist_name": self.artist})
+
+        def got_exact(data):
+            if track != self.track_id or not self.win:
+                return
+            if data:
+                self.show_lyrics(data)
+            else:
+                self.fetch_json(f"{LRCLIB}/search?{loose}", got_search)
+
+        def got_search(results):
+            if track == self.track_id and self.win:
+                self.show_lyrics(best_match(results, self.length))
+
+        self.fetch_json(f"{LRCLIB}/get?{exact}", got_exact)
+
+    def clear_lyrics(self):
+        while child := self.lyrics_box.get_first_child():
+            self.lyrics_box.remove(child)
+        self.lyric_times = []
+        self.lyric_rows = []
+        self.lyric_lines = []
+        self.current_line = -1
+        self.recentre = True
+        self.lyrics_scroll.get_vadjustment().set_value(0)
+        self.update_translate_button()
+
+    def set_lyrics_message(self, text):
+        self.clear_lyrics()
+        label = Gtk.Label(label=text, vexpand=True, valign=Gtk.Align.CENTER)
+        label.add_css_class("dim")
+        self.lyrics_box.append(label)
+
+    def show_lyrics(self, data):
+        if not data:
+            return self.set_lyrics_message("No lyrics found for this song")
+        if data.get("instrumental"):
+            return self.set_lyrics_message("♪  Instrumental  ♪")
+        synced = parse_lrc(data.get("syncedLyrics") or "")
+        plain = data.get("plainLyrics")
+        if not synced and not plain:
+            return self.set_lyrics_message("No lyrics found for this song")
+
+        self.clear_lyrics()
+        # Synced lines are clickable (jump to that moment); plain lyrics have no timings.
+        lines = synced or [(None, line.strip()) for line in plain.splitlines()]
+        for start, words in lines:
+            row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+            row.add_css_class("lyric")
+            row.append(Gtk.Label(label=words or ("♪" if synced else ""), wrap=True,
+                                 justify=Gtk.Justification.CENTER))
+            translation = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER, visible=False)
+            translation.add_css_class("translation")
+            row.append(translation)
+            if start is None:
+                row.add_css_class("plain")
+            else:
+                row.set_cursor_from_name("pointer")
+                click = Gtk.GestureClick()
+                click.connect("released", lambda *_args, t=start: self.seek_to(t))
+                row.add_controller(click)
+            self.lyrics_box.append(row)
+            self.lyric_rows.append(row)
+            self.lyric_lines.append(words)
+        self.lyric_times = [start for start, _words in synced]
+        self.update_translate_button()
+        if self.translate_btn.get_active():
+            self.load_translation()
+
+    # --- translation ----------------------------------------------------------
+
+    def update_translate_button(self):
+        # Offer EN only while lyrics are on screen and aren't English already.
+        foreign = any(not ch.isascii() and ch.isalpha() for line in self.lyric_lines for ch in line)
+        self.translate_btn.set_visible(self.lyrics_btn.get_active() and foreign)
+
+    def on_translate_toggled(self, button):
+        on = button.get_active()
+        try:
+            if on:
+                open(TRANSLATE_FLAG, "w").close()
+            elif os.path.exists(TRANSLATE_FLAG):
+                os.remove(TRANSLATE_FLAG)
+        except OSError:
+            pass
+        if on:
+            self.load_translation()
+        else:
+            self.show_translation(None)
+
+    def load_translation(self):
+        if not self.lyric_rows:
+            return
+        track = self.track_id
+        if track in self.translations:
+            return self.show_translation(self.translations[track])
+        # Send only lines with words in them, one per line, and map the answers back.
+        wanted = [i for i, line in enumerate(self.lyric_lines) if any(ch.isalpha() for ch in line)]
+        message = Soup.Message.new("POST", TRANSLATE)
+        body = urlencode({"q": "\n".join(self.lyric_lines[i] for i in wanted)}).encode()
+        message.set_request_body_from_bytes("application/x-www-form-urlencoded;charset=utf-8", GLib.Bytes.new(body))
+
+        def done(data):
+            if track != self.track_id or not self.win or not data:
+                return
+            # Google splits the text into segments; joined back they keep our line breaks.
+            english = "".join(segment[0] or "" for segment in data[0] or []).split("\n")
+            lines = [""] * len(self.lyric_lines)
+            for i, text in zip(wanted, english):
+                lines[i] = text.strip()
+            self.translations[track] = lines
+            if self.translate_btn.get_active():
+                self.show_translation(lines)
+
+        self.fetch_json(message, done)
+
+    def show_translation(self, lines):
+        for i, row in enumerate(self.lyric_rows):
+            label = row.get_last_child()
+            text = lines[i] if lines else ""
+            # Skip lines that come back unchanged (already English, "Oh wow…").
+            same = text.casefold() == self.lyric_lines[i].strip().casefold()
+            label.set_text(text)
+            label.set_visible(bool(text) and not same)
+        self.recentre = True
+
+    def follow_lyrics(self, position):
+        # Wait for the slide-open to finish: before that the rows have no real
+        # layout yet, so their positions (and the scroll target) would be wrong.
+        if not self.lyric_times or not self.revealer.get_child_revealed():
+            return
+        line = bisect.bisect_right(self.lyric_times, position + 0.15) - 1
+        if line != self.current_line:
+            if 0 <= self.current_line < len(self.lyric_rows):
+                self.lyric_rows[self.current_line].remove_css_class("current")
+            self.current_line = line
+            self.recentre = True
+            if line >= 0:
+                self.lyric_rows[line].add_css_class("current")
+        if self.recentre and line >= 0:
+            self.recentre = not self.scroll_to(self.lyric_rows[line])
+
+    def scroll_to(self, row):
+        """Start scrolling row to the middle of the panel; False if it isn't laid out yet."""
+        ok, bounds = row.compute_bounds(self.lyrics_box)
+        if not ok or row.get_height() == 0:
+            return False
+        adj = self.lyrics_scroll.get_vadjustment()
+        target = bounds.get_y() + bounds.get_height() / 2 - adj.get_page_size() / 2
+        self.scroll_target = min(max(target, 0), max(adj.get_upper() - adj.get_page_size(), 0))
+        if not self.scroll_anim:
+            self.scroll_anim = self.lyrics_scroll.add_tick_callback(self.animate_scroll)
+        return True
+
+    def animate_scroll(self, _widget, _clock):
+        adj = self.lyrics_scroll.get_vadjustment()
+        delta = self.scroll_target - adj.get_value()
+        if abs(delta) < 0.5:
+            adj.set_value(self.scroll_target)
+            self.scroll_anim = 0
+            return False
+        adj.set_value(adj.get_value() + delta * 0.18)
+        return True
+
+
+if __name__ == "__main__":
+    sys.exit(MusicPopup().run(sys.argv))
